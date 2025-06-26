@@ -1,3 +1,5 @@
+# /utils/render_utils.py
+
 import torch
 @torch.no_grad()
 def get_state_at_time(pc,viewpoint_camera):    

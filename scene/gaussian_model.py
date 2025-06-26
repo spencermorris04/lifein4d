@@ -1,13 +1,4 @@
-#
-# Copyright (C) 2023, Inria
-# GRAPHDECO research group, https://team.inria.fr/graphdeco
-# All rights reserved.
-#
-# This software is free for non-commercial, research and evaluation use 
-# under the terms of the LICENSE.md file.
-#
-# For inquiries contact  george.drettakis@inria.fr
-#
+# /scene/gaussian_model.py
 
 import torch
 import numpy as np
@@ -24,6 +15,14 @@ from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.deformation import deform_network
 from scene.regulation import compute_plane_smoothness
+
+# New imports for mono4dgs
+from scene.deformation_field import SplatDeformationManager
+
+# Checkpoint version for backward compatibility
+CHECKPOINT_VERSION = 2
+
+
 class GaussianModel:
 
     def setup_functions(self):
@@ -61,10 +60,24 @@ class GaussianModel:
         self.percent_dense = 0
         self.spatial_lr_scale = 0
         self._deformation_table = torch.empty(0)
+        
+        # New fields for mono4dgs
+        self.enable_mono4dgs = getattr(args, 'enable_mono4dgs', False)
+        if self.enable_mono4dgs:
+            self.deform_rank = getattr(args, 'deform_rank', 4)
+            self.num_rigid_clusters = getattr(args, 'num_rigid_clusters', 8)
+            
+            # Initialize deformation manager (will be set when splats are created)
+            self._deformation_manager = None
+            
+            # Cluster assignments for rigid transforms
+            self._cluster_ids = torch.empty(0, dtype=torch.long)
+        
         self.setup_functions()
 
     def capture(self):
-        return (
+        capture_tuple = (
+            CHECKPOINT_VERSION,  # Version at index 0 for compatibility
             self.active_sh_degree,
             self._xyz,
             self._deformation.state_dict(),
@@ -81,28 +94,123 @@ class GaussianModel:
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
+        
+        # Add mono4dgs fields if enabled
+        if self.enable_mono4dgs and self._deformation_manager is not None:
+            mono4dgs_tuple = (
+                self._deformation_manager.W,
+                self._cluster_ids,
+            )
+            capture_tuple = capture_tuple + mono4dgs_tuple
+        
+        return capture_tuple
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        deform_state,
-        self._deformation_table,
+        # Check version for backward compatibility
+        if isinstance(model_args[0], int) and model_args[0] == CHECKPOINT_VERSION:
+            # Version 2 format with mono4dgs
+            if len(model_args) > 17:  # Has mono4dgs fields
+                (version,
+                self.active_sh_degree, 
+                self._xyz, 
+                deform_state,
+                self._deformation_table,
+                # self.grid,
+                self._features_dc, 
+                self._features_rest,
+                self._scaling, 
+                self._rotation, 
+                self._opacity,
+                self.max_radii2D, 
+                xyz_gradient_accum, 
+                denom,
+                opt_dict, 
+                self.spatial_lr_scale,
+                deform_W,
+                cluster_ids) = model_args
+                
+                # Restore deformation manager
+                if self._deformation_manager is None:
+                    self._deformation_manager = SplatDeformationManager(
+                        num_splats=self._xyz.shape[0],
+                        rank=self.deform_rank,
+                        device=self._xyz.device,
+                        dtype=torch.float16,
+                    )
+                self._deformation_manager.W = nn.Parameter(deform_W.requires_grad_(True))
+                self._cluster_ids = cluster_ids.requires_grad_(False)
+            else:
+                # Version 2 without mono4dgs
+                (version,
+                self.active_sh_degree, 
+                self._xyz, 
+                deform_state,
+                self._deformation_table,
+                # self.grid,
+                self._features_dc, 
+                self._features_rest,
+                self._scaling, 
+                self._rotation, 
+                self._opacity,
+                self.max_radii2D, 
+                xyz_gradient_accum, 
+                denom,
+                opt_dict, 
+                self.spatial_lr_scale) = model_args
+        else:
+            # Legacy version 1 format (no version field)
+            if self.enable_mono4dgs and len(model_args) > 15:
+                # Legacy with mono4dgs fields
+                (self.active_sh_degree, 
+                self._xyz, 
+                deform_state,
+                self._deformation_table,
+                # self.grid,
+                self._features_dc, 
+                self._features_rest,
+                self._scaling, 
+                self._rotation, 
+                self._opacity,
+                self.max_radii2D, 
+                xyz_gradient_accum, 
+                denom,
+                opt_dict, 
+                self.spatial_lr_scale,
+                deform_W,
+                cluster_ids) = model_args
+                
+                # Restore deformation manager
+                if self._deformation_manager is None:
+                    self._deformation_manager = SplatDeformationManager(
+                        num_splats=self._xyz.shape[0],
+                        rank=self.deform_rank,
+                        device=self._xyz.device,
+                        dtype=torch.float16,
+                    )
+                self._deformation_manager.W = nn.Parameter(deform_W.requires_grad_(True))
+                self._cluster_ids = cluster_ids.requires_grad_(False)
+            else:
+                # Legacy standard restore
+                (self.active_sh_degree, 
+                self._xyz, 
+                deform_state,
+                self._deformation_table,
+                # self.grid,
+                self._features_dc, 
+                self._features_rest,
+                self._scaling, 
+                self._rotation, 
+                self._opacity,
+                self.max_radii2D, 
+                xyz_gradient_accum, 
+                denom,
+                opt_dict, 
+                self.spatial_lr_scale) = model_args
         
-        # self.grid,
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
         self._deformation.load_state_dict(deform_state)
         self.training_setup(training_args)
-        self.xyz_gradient_accum = xyz_gradient_accum
-        self.denom = denom
+        self.xyz_gradient_accum = xyz_gradient_accum.requires_grad_(False)
+        self.denom = denom.requires_grad_(False)
         self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -130,13 +238,62 @@ class GaussianModel:
     def get_covariance(self, scaling_modifier = 1):
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
+    # New methods for mono4dgs
+    @property
+    def get_deformation_basis(self):
+        """Get deformation basis matrices W [N, 3, r]."""
+        if self.enable_mono4dgs and self._deformation_manager is not None:
+            return self._deformation_manager.get_basis_matrices()
+        return None
+    
+    @property
+    def get_cluster_ids(self):
+        """Get cluster IDs for rigid transforms [N]."""
+        if self.enable_mono4dgs:
+            return self._cluster_ids
+        return None
+    
+    @property
+    def checkpoint_version(self):
+        """Get current checkpoint version."""
+        return CHECKPOINT_VERSION
+    
+    def set_checkpoint_version(self, version):
+        """Set checkpoint version (for testing backward compatibility)."""
+        global CHECKPOINT_VERSION
+        CHECKPOINT_VERSION = version
+    
+    def apply_mono_deformation(self, time_coefficients):
+        """
+        Apply monocular deformation using low-rank basis.
+        
+        Args:
+            time_coefficients: Time-dependent coefficients [r]
+            
+        Returns:
+            deformed_xyz: Deformed splat positions [N, 3]
+        """
+        if not self.enable_mono4dgs or self._deformation_manager is None:
+            return self._xyz
+        
+        from kernels.triton_deform import apply_deformation
+        
+        W = self._deformation_manager.get_basis_matrices()
+        deformed_xyz = apply_deformation(self._xyz, W, time_coefficients)
+        
+        return deformed_xyz
+    
+    def set_cluster_assignments(self, cluster_ids):
+        """Set cluster assignments for rigid transforms."""
+        if self.enable_mono4dgs:
+            self._cluster_ids = cluster_ids.to(self._xyz.device)
+
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
             self.active_sh_degree += 1
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float, time_line: int):
         self.spatial_lr_scale = spatial_lr_scale
-        # breakpoint()
         fused_point_cloud = torch.tensor(np.asarray(pcd.points)).float().cuda()
         fused_color = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
@@ -154,7 +311,6 @@ class GaussianModel:
 
         self._xyz = nn.Parameter(fused_point_cloud.requires_grad_(True))
         self._deformation = self._deformation.to("cuda") 
-        # self.grid = self.grid.to("cuda")
         self._features_dc = nn.Parameter(features[:,:,0:1].transpose(1, 2).contiguous().requires_grad_(True))
         self._features_rest = nn.Parameter(features[:,:,1:].transpose(1, 2).contiguous().requires_grad_(True))
         self._scaling = nn.Parameter(scales.requires_grad_(True))
@@ -162,6 +318,24 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
+        
+        # Initialize mono4dgs components
+        if self.enable_mono4dgs:
+            num_splats = fused_point_cloud.shape[0]
+            
+            # Initialize deformation manager
+            self._deformation_manager = SplatDeformationManager(
+                num_splats=num_splats,
+                rank=self.deform_rank,
+                device="cuda",
+                dtype=torch.float16,
+            )
+            
+            # Initialize cluster assignments (random for now)
+            self._cluster_ids = torch.randint(
+                0, self.num_rigid_clusters, (num_splats,), device="cuda", dtype=torch.long
+            )
+    
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -178,8 +352,16 @@ class GaussianModel:
             {'params': [self._opacity], 'lr': training_args.opacity_lr, "name": "opacity"},
             {'params': [self._scaling], 'lr': training_args.scaling_lr, "name": "scaling"},
             {'params': [self._rotation], 'lr': training_args.rotation_lr, "name": "rotation"}
-            
         ]
+        
+        # Add mono4dgs parameters to optimizer
+        if self.enable_mono4dgs and self._deformation_manager is not None:
+            deform_lr = getattr(training_args, 'deform_lr', 1e-3)
+            l.append({
+                'params': [self._deformation_manager.W], 
+                'lr': deform_lr * self.spatial_lr_scale, 
+                "name": "deform_basis"
+            })
 
         self.optimizer = torch.optim.Adam(l, lr=0.0, eps=1e-15)
         self.xyz_scheduler_args = get_expon_lr_func(lr_init=training_args.position_lr_init*self.spatial_lr_scale,
@@ -201,15 +383,16 @@ class GaussianModel:
             if param_group["name"] == "xyz":
                 lr = self.xyz_scheduler_args(iteration)
                 param_group['lr'] = lr
-                # return lr
             if  "grid" in param_group["name"]:
                 lr = self.grid_scheduler_args(iteration)
                 param_group['lr'] = lr
-                # return lr
             elif param_group["name"] == "deformation":
                 lr = self.deformation_scheduler_args(iteration)
                 param_group['lr'] = lr
-                # return lr
+            elif param_group["name"] == "deform_basis":
+                # Use deformation scheduler for basis matrices
+                lr = self.deformation_scheduler_args(iteration)
+                param_group['lr'] = lr
 
     def construct_list_of_attributes(self):
         l = ['x', 'y', 'z', 'nx', 'ny', 'nz']
@@ -223,9 +406,17 @@ class GaussianModel:
             l.append('scale_{}'.format(i))
         for i in range(self._rotation.shape[1]):
             l.append('rot_{}'.format(i))
-        return l
-    def compute_deformation(self,time):
         
+        # Add mono4dgs attributes
+        if self.enable_mono4dgs and self._deformation_manager is not None:
+            for i in range(self._deformation_manager.rank):
+                for j in range(3):
+                    l.append('deform_w_{}_{}'.format(j, i))
+            l.append('cluster_id')
+        
+        return l
+
+    def compute_deformation(self,time):
         deform = self._deformation[:,:,:time].sum(dim=-1)
         xyz = self._xyz + deform
         return xyz
@@ -242,11 +433,37 @@ class GaussianModel:
         if os.path.exists(os.path.join(path, "deformation_accum.pth")):
             self._deformation_accum = torch.load(os.path.join(path, "deformation_accum.pth"),map_location="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
-        # print(self._deformation.deformation_net.grid.)
+        
+        # Load mono4dgs components
+        if self.enable_mono4dgs:
+            mono_path = os.path.join(path, "mono4dgs.pth")
+            if os.path.exists(mono_path):
+                mono_dict = torch.load(mono_path, map_location="cuda")
+                
+                if self._deformation_manager is None:
+                    self._deformation_manager = SplatDeformationManager(
+                        num_splats=self.get_xyz.shape[0],
+                        rank=self.deform_rank,
+                        device="cuda",
+                        dtype=torch.float16,
+                    )
+                
+                self._deformation_manager.W = nn.Parameter(mono_dict['deform_W'])
+                self._cluster_ids = mono_dict['cluster_ids']
+
     def save_deformation(self, path):
         torch.save(self._deformation.state_dict(),os.path.join(path, "deformation.pth"))
         torch.save(self._deformation_table,os.path.join(path, "deformation_table.pth"))
         torch.save(self._deformation_accum,os.path.join(path, "deformation_accum.pth"))
+        
+        # Save mono4dgs components
+        if self.enable_mono4dgs and self._deformation_manager is not None:
+            mono_dict = {
+                'deform_W': self._deformation_manager.W,
+                'cluster_ids': self._cluster_ids,
+            }
+            torch.save(mono_dict, os.path.join(path, "mono4dgs.pth"))
+
     def save_ply(self, path):
         mkdir_p(os.path.dirname(path))
 
@@ -258,10 +475,23 @@ class GaussianModel:
         scale = self._scaling.detach().cpu().numpy()
         rotation = self._rotation.detach().cpu().numpy()
         
+        # Add mono4dgs attributes
+        attributes_list = [xyz, normals, f_dc, f_rest, opacities, scale, rotation]
+        
+        if self.enable_mono4dgs and self._deformation_manager is not None:
+            # Flatten deformation basis matrices
+            deform_W = self._deformation_manager.W.detach().cpu().numpy()  # [N, 3, r]
+            deform_W_flat = deform_W.reshape(deform_W.shape[0], -1)  # [N, 3*r]
+            
+            # Cluster IDs
+            cluster_ids = self._cluster_ids.detach().cpu().numpy().reshape(-1, 1)  # [N, 1]
+            
+            attributes_list.extend([deform_W_flat, cluster_ids])
+        
         dtype_full = [(attribute, 'f4') for attribute in self.construct_list_of_attributes()]
 
         elements = np.empty(xyz.shape[0], dtype=dtype_full)
-        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        attributes = np.concatenate(attributes_list, axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
@@ -290,7 +520,6 @@ class GaussianModel:
         features_extra = np.zeros((xyz.shape[0], len(extra_f_names)))
         for idx, attr_name in enumerate(extra_f_names):
             features_extra[:, idx] = np.asarray(plydata.elements[0][attr_name])
-        # Reshape (P,F*SH_coeffs) to (P, F, SH_coeffs except DC)
         features_extra = features_extra.reshape((features_extra.shape[0], 3, (self.max_sh_degree + 1) ** 2 - 1))
 
         scale_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("scale_")]
@@ -311,6 +540,37 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
+        
+        # Load mono4dgs attributes if present
+        if self.enable_mono4dgs:
+            deform_w_names = [p.name for p in plydata.elements[0].properties if p.name.startswith("deform_w_")]
+            
+            if deform_w_names:
+                # Sort by coordinate and rank indices
+                deform_w_names = sorted(deform_w_names, key=lambda x: (int(x.split('_')[2]), int(x.split('_')[3])))
+                
+                deform_W_flat = np.zeros((xyz.shape[0], len(deform_w_names)))
+                for idx, attr_name in enumerate(deform_w_names):
+                    deform_W_flat[:, idx] = np.asarray(plydata.elements[0][attr_name])
+                
+                # Reshape to [N, 3, r]
+                deform_W = deform_W_flat.reshape(xyz.shape[0], 3, self.deform_rank)
+                
+                # Load cluster IDs
+                cluster_ids = np.asarray(plydata.elements[0]["cluster_id"]).astype(np.int64)
+                
+                # Initialize deformation manager
+                self._deformation_manager = SplatDeformationManager(
+                    num_splats=xyz.shape[0],
+                    rank=self.deform_rank,
+                    device="cuda",
+                    dtype=torch.float16,
+                )
+                self._deformation_manager.W = nn.Parameter(
+                    torch.tensor(deform_W, dtype=torch.float16, device="cuda")
+                )
+                self._cluster_ids = torch.tensor(cluster_ids, dtype=torch.long, device="cuda")
+        
         self.active_sh_degree = self.max_sh_degree
 
     def replace_tensor_to_optimizer(self, tensor, name):
@@ -363,6 +623,11 @@ class GaussianModel:
         self._deformation_table = self._deformation_table[valid_points_mask]
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
+        
+        # Prune mono4dgs components
+        if self.enable_mono4dgs and self._deformation_manager is not None:
+            self._deformation_manager.remove_splats(valid_points_mask)
+            self._cluster_ids = self._cluster_ids[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -387,15 +652,18 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table):
+    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table, new_cluster_ids=None, new_deform_W=None):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
         "opacity": new_opacities,
         "scaling" : new_scaling,
         "rotation" : new_rotation,
-        # "deformation": new_deformation
        }
+        
+        # Add mono4dgs tensors if enabled
+        if self.enable_mono4dgs and new_deform_W is not None:
+            d["deform_basis"] = new_deform_W
 
         optimizable_tensors = self.cat_tensors_to_optimizer(d)
         self._xyz = optimizable_tensors["xyz"]
@@ -404,7 +672,13 @@ class GaussianModel:
         self._opacity = optimizable_tensors["opacity"]
         self._scaling = optimizable_tensors["scaling"]
         self._rotation = optimizable_tensors["rotation"]
-        # self._deformation = optimizable_tensors["deformation"]
+        
+        # Update mono4dgs components
+        if self.enable_mono4dgs:
+            if new_deform_W is not None:
+                self._deformation_manager.W = optimizable_tensors["deform_basis"]
+            if new_cluster_ids is not None:
+                self._cluster_ids = torch.cat([self._cluster_ids, new_cluster_ids], dim=0)
         
         self._deformation_table = torch.cat([self._deformation_table,new_deformation_table],-1)
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -414,12 +688,10 @@ class GaussianModel:
 
     def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
         n_init_points = self.get_xyz.shape[0]
-        # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
         padded_grad[:grads.shape[0]] = grads.squeeze()
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
 
-        # breakpoint()
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
         if not selected_pts_mask.any():
@@ -435,7 +707,16 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_deformation_table = self._deformation_table[selected_pts_mask].repeat(N)
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_deformation_table)
+        
+        # Handle mono4dgs components
+        new_cluster_ids = None
+        new_deform_W = None
+        if self.enable_mono4dgs and self._deformation_manager is not None:
+            new_cluster_ids = self._cluster_ids[selected_pts_mask].repeat(N)
+            selected_W = self._deformation_manager.W[selected_pts_mask]  # [S, 3, r]
+            new_deform_W = selected_W.repeat(N, 1, 1)  # [N*S, 3, r]
+        
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_deformation_table, new_cluster_ids, new_deform_W)
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
@@ -443,7 +724,6 @@ class GaussianModel:
     def densify_and_clone(self, grads, grad_threshold, scene_extent, density_threshold=20, displacement_scale=20, model_path=None, iteration=None, stage=None):
         grads_accum_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         
-
         selected_pts_mask = torch.logical_and(grads_accum_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
         new_xyz = self._xyz[selected_pts_mask] 
@@ -453,11 +733,20 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask]
         new_rotation = self._rotation[selected_pts_mask]
         new_deformation_table = self._deformation_table[selected_pts_mask]
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
+        
+        # Handle mono4dgs components
+        new_cluster_ids = None
+        new_deform_W = None
+        if self.enable_mono4dgs and self._deformation_manager is not None:
+            new_cluster_ids = self._cluster_ids[selected_pts_mask]
+            new_deform_W = self._deformation_manager.W[selected_pts_mask]
+        
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table, new_cluster_ids, new_deform_W)
 
     @property
     def get_aabb(self):
         return self._deformation.get_aabb
+    
     def get_displayment(self,selected_point, point, perturb):
         xyz_max, xyz_min = self.get_aabb
         displacements = torch.randn(selected_point.shape[0], 3).to(selected_point) * perturb
@@ -469,8 +758,8 @@ class GaussianModel:
         mask_d = mask_c.all(dim=1)
         final_point = final_point[mask_d]
     
-
         return final_point, mask_d    
+    
     def add_point_by_mask(self, selected_pts_mask, perturb=0):
         selected_xyz = self._xyz[selected_pts_mask] 
         new_xyz, mask = self.get_displayment(selected_xyz, self.get_xyz.detach(),perturb)
@@ -482,8 +771,15 @@ class GaussianModel:
         new_scaling = self._scaling[selected_pts_mask][mask]
         new_rotation = self._rotation[selected_pts_mask][mask]
         new_deformation_table = self._deformation_table[selected_pts_mask][mask]
+        
+        # Handle mono4dgs components
+        new_cluster_ids = None
+        new_deform_W = None
+        if self.enable_mono4dgs and self._deformation_manager is not None:
+            new_cluster_ids = self._cluster_ids[selected_pts_mask][mask]
+            new_deform_W = self._deformation_manager.W[selected_pts_mask][mask]
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table)
+        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_deformation_table, new_cluster_ids, new_deform_W)
         return selected_xyz, new_xyz
 
     def prune(self, max_grad, min_opacity, extent, max_screen_size):
@@ -493,19 +789,19 @@ class GaussianModel:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(prune_mask, big_points_vs)
-
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
 
         torch.cuda.empty_cache()
+    
     def densify(self, max_grad, min_opacity, extent, max_screen_size, density_threshold, displacement_scale, model_path=None, iteration=None, stage=None):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.densify_and_clone(grads, max_grad, extent, density_threshold, displacement_scale, model_path, iteration, stage)
         self.densify_and_split(grads, max_grad, extent)
-    def standard_constaint(self):
         
+    def standard_constaint(self):
         means3D = self._xyz.detach()
         scales = self._scaling.detach()
         rotations = self._rotation.detach()
@@ -517,28 +813,27 @@ class GaussianModel:
         scaling_erorr = (scales_deform - scales)**2
         return position_error.mean() + rotation_error.mean() + scaling_erorr.mean()
 
-
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+    
     @torch.no_grad()
     def update_deformation_table(self,threshold):
-        # print("origin deformation point nums:",self._deformation_table.sum())
         self._deformation_table = torch.gt(self._deformation_accum.max(dim=-1).values/100,threshold)
+    
     def print_deformation_weight_grad(self):
         for name, weight in self._deformation.named_parameters():
             if weight.requires_grad:
                 if weight.grad is None:
-                    
                     print(name," :",weight.grad)
                 else:
                     if weight.grad.mean() != 0:
                         print(name," :",weight.grad.mean(), weight.grad.min(), weight.grad.max())
         print("-"*50)
+    
     def _plane_regulation(self):
         multi_res_grids = self._deformation.deformation_net.grid.grids
         total = 0
-        # model.grids is 6 x [1, rank * F_dim, reso, reso]
         for grids in multi_res_grids:
             if len(grids) == 3:
                 time_grids = []
@@ -547,10 +842,10 @@ class GaussianModel:
             for grid_id in time_grids:
                 total += compute_plane_smoothness(grids[grid_id])
         return total
+    
     def _time_regulation(self):
         multi_res_grids = self._deformation.deformation_net.grid.grids
         total = 0
-        # model.grids is 6 x [1, rank * F_dim, reso, reso]
         for grids in multi_res_grids:
             if len(grids) == 3:
                 time_grids = []
@@ -559,19 +854,18 @@ class GaussianModel:
             for grid_id in time_grids:
                 total += compute_plane_smoothness(grids[grid_id])
         return total
+    
     def _l1_regulation(self):
-                # model.grids is 6 x [1, rank * F_dim, reso, reso]
         multi_res_grids = self._deformation.deformation_net.grid.grids
-
         total = 0.0
         for grids in multi_res_grids:
             if len(grids) == 3:
                 continue
             else:
-                # These are the spatiotemporal grids
                 spatiotemporal_grids = [2, 4, 5]
             for grid_id in spatiotemporal_grids:
                 total += torch.abs(1 - grids[grid_id]).mean()
         return total
+    
     def compute_regulation(self, time_smoothness_weight, l1_time_planes_weight, plane_tv_weight):
         return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()
