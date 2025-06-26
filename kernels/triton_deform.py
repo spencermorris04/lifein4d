@@ -4,39 +4,39 @@ import triton
 import triton.language as tl
 from torch.autograd import Function
 
-
 # --------------------------------------------------------------------------- #
-# Deformation kernel  (μ_out = μ + W @ b(t))
+# Deformation kernel  μ_out = μ + W @ b(t)
 # --------------------------------------------------------------------------- #
 @triton.jit
 def deform_update_kernel(
     mu_ptr,                # [N, 3]  fp32
-    W_ptr,                 # [N, 3, r]  fp16
-    b_ptr,                 # [r]  fp16
+    W_ptr,                 # [N, 3, r] fp16
+    b_ptr,                 # [r]      fp16
     mu_out_ptr,            # [N, 3]  fp32
-    visibility_mask_ptr,   # [N] bool  (0 ⇒ no mask)
+    visibility_mask_ptr,   # [N] bool    (ignored if USE_MASK = False)
     N: tl.constexpr,
     r: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    USE_MASK: tl.constexpr,              ### NEW
 ):
-    """Fused update with optional visibility masking (no break / continue)."""
-    pid = tl.program_id(axis=0)
+    """Fused centroid update without break/continue; optional visibility mask."""
+    pid         = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
 
-    # Load time coefficients into registers
-    b = tl.load(b_ptr + tl.arange(0, r)).to(tl.float32)       # [r]
+    # Put time-coefficients in registers
+    b = tl.load(b_ptr + tl.arange(0, r)).to(tl.float32)
 
-    for offset in tl.static_range(BLOCK_SIZE):                # compile-time loop
+    for offset in tl.static_range(BLOCK_SIZE):  # unrolled, compile-time
         splat_idx = block_start + offset
-        if splat_idx >= N:
-            # skip lanes that run past the tensor
-            pass
-        else:
-            # visibility
-            is_visible = True
-            if visibility_mask_ptr != 0:
-                is_visible = tl.load(visibility_mask_ptr + splat_idx)
+        lane_is_valid = splat_idx < N
 
+        if lane_is_valid:
+            if USE_MASK:                         ### NEW
+                is_visible = tl.load(visibility_mask_ptr + splat_idx)
+            else:                                ### NEW
+                is_visible = True
+
+            # base μ
             mu = tl.load(mu_ptr + splat_idx * 3 + tl.arange(0, 3)).to(tl.float32)
 
             delta = tl.zeros([3], dtype=tl.float32)
@@ -46,7 +46,6 @@ def deform_update_kernel(
                     W_col = tl.load(W_base + tl.arange(0, 3) * r + j).to(tl.float32)
                     delta += W_col * b[j]
 
-            # invisible splats just add zero
             tl.store(
                 mu_out_ptr + splat_idx * 3 + tl.arange(0, 3),
                 mu + delta,
@@ -54,7 +53,7 @@ def deform_update_kernel(
 
 
 # --------------------------------------------------------------------------- #
-# Depth residual kernel (smooth-L1 + confidence) – no continue/break
+# Depth residual kernel (smooth-L1 with confidence) — no break/continue
 # --------------------------------------------------------------------------- #
 @triton.autotune(
     configs=[
@@ -66,67 +65,63 @@ def deform_update_kernel(
 )
 @triton.jit
 def depth_residual_kernel(
-    id_buffer_ptr,          # [H, W] int32   (splat id; -1 = background)
-    mu_z_ptr,               # [N]     fp32
-    depth_ptr,              # [H, W] fp32    (ground-truth depth)
-    confidence_ptr,         # [H, W] fp32
-    grad_mu_z_ptr,          # [N]     fp32   (atomic add)
-    loss_acc_ptr,           # [num_blocks] fp32
-    valid_cnt_ptr,          # [num_blocks] int32
+    id_buffer_ptr,       # [H, W] int32  (splat id, −1 = bg)
+    mu_z_ptr,            # [N] fp32
+    depth_ptr,           # [H, W] fp32
+    conf_ptr,            # [H, W] fp32
+    grad_mu_z_ptr,       # [N] fp32   (atomic add)
+    loss_acc_ptr,        # [num_blocks] fp32
+    valid_cnt_ptr,       # [num_blocks] int32
     N: tl.constexpr,
     H: tl.constexpr,
     W: tl.constexpr,
     HUBER_DELTA: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    pid = tl.program_id(axis=0)
+    pid         = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
 
     thread_loss  = tl.float32(0.0)
     thread_valid = 0
 
     for i in tl.static_range(BLOCK_SIZE):
-        pixel_idx = block_start + i
-        if pixel_idx < H * W:   # else skip
-            splat_id = tl.load(id_buffer_ptr + pixel_idx).to(tl.int32)
+        pix = block_start + i
+        if pix < H * W:
+            sid   = tl.load(id_buffer_ptr + pix).to(tl.int32)
+            good  = (sid >= 0) & (sid < N)
 
-            good_id = (splat_id >= 0) & (splat_id < N)
-            if good_id:
-                gt_depth   = tl.load(depth_ptr + pixel_idx)
-                confidence = tl.load(confidence_ptr + pixel_idx)
-                valid_pix  = (confidence > 0.0) & (gt_depth > 0.0)
+            if good:
+                d_gt = tl.load(depth_ptr + pix)
+                c    = tl.load(conf_ptr + pix)
+                good = (c > 0.0) & (d_gt > 0.0)
 
-                if valid_pix:
-                    pred_depth = tl.load(mu_z_ptr + splat_id)
-                    residual   = pred_depth - gt_depth
-                    abs_res    = tl.abs(residual)
+                if good:
+                    d_pred = tl.load(mu_z_ptr + sid)
+                    res    = d_pred - d_gt
+                    abs_r  = tl.abs(res)
 
-                    quad_region = abs_res <= HUBER_DELTA
-                    loss_val = tl.where(
-                        quad_region,
-                        0.5 * residual * residual / HUBER_DELTA,
-                        abs_res - 0.5 * HUBER_DELTA,
+                    quad   = abs_r <= HUBER_DELTA
+                    loss   = tl.where(
+                        quad,
+                        0.5 * res * res / HUBER_DELTA,
+                        abs_r - 0.5 * HUBER_DELTA,
                     )
-                    grad_val = tl.where(
-                        quad_region,
-                        residual / HUBER_DELTA,
-                        tl.where(residual > 0, 1.0, -1.0),
+                    grad   = tl.where(
+                        quad,
+                        res / HUBER_DELTA,
+                        tl.where(res > 0, 1.0, -1.0),
                     )
 
-                    weighted_loss = confidence * loss_val
-                    weighted_grad = confidence * grad_val
-
-                    thread_loss  += weighted_loss
+                    thread_loss  += c * loss
                     thread_valid += 1
-                    tl.atomic_add(grad_mu_z_ptr + splat_id, weighted_grad)
+                    tl.atomic_add(grad_mu_z_ptr + sid, c * grad)
 
-    # one store per block (safe, deterministic)
     tl.store(loss_acc_ptr  + pid, thread_loss)
     tl.store(valid_cnt_ptr + pid, thread_valid)
 
 
 # --------------------------------------------------------------------------- #
-# PyTorch autograd wrappers
+# Autograd wrappers
 # --------------------------------------------------------------------------- #
 class DeformUpdateFunction(Function):
     @staticmethod
@@ -138,11 +133,14 @@ class DeformUpdateFunction(Function):
         BLOCK = 256
         grid  = (triton.cdiv(N, BLOCK),)
 
-        vis_ptr = visibility_mask if visibility_mask is not None else 0
+        use_mask = visibility_mask is not None              ### NEW
+        vis_ptr  = visibility_mask if use_mask else mu      ### dummy ptr (never read)
+
         deform_update_kernel[grid](
             mu, W, b, out, vis_ptr,
-            N=N, r=r, BLOCK_SIZE=BLOCK,
+            N=N, r=r, BLOCK_SIZE=BLOCK, USE_MASK=use_mask, ### NEW
         )
+
         ctx.save_for_backward(W, b, visibility_mask)
         return out
 
@@ -169,6 +167,7 @@ class DepthResidualFunction(Function):
 
         BLOCK = 256
         nb = triton.cdiv(H * W, BLOCK)
+
         loss_acc  = torch.zeros(nb, device=mu_z.device, dtype=torch.float32)
         valid_cnt = torch.zeros(nb, device=mu_z.device, dtype=torch.int32)
         grad_mu_z = torch.zeros_like(mu_z)
@@ -183,6 +182,7 @@ class DepthResidualFunction(Function):
 
         tot_loss   = loss_acc.sum()
         tot_pixels = valid_cnt.sum().float()
+
         if tot_pixels > 0:
             loss = tot_loss / tot_pixels
             grad = grad_mu_z / tot_pixels
@@ -207,27 +207,32 @@ def apply_deformation(mu, W, b, visibility_mask=None):
 
 
 def compute_depth_loss(mu_z, id_buffer, depth, confidence, huber_delta=0.01):
-    return DepthResidualFunction.apply(mu_z, id_buffer, depth, confidence, huber_delta)
+    return DepthResidualFunction.apply(
+        mu_z, id_buffer, depth, confidence, huber_delta
+    )
 
 
+# --------------------------------------------------------------------------- #
+# Ahead-of-time compilation helper
+# --------------------------------------------------------------------------- #
 def compile_kernels():
-    """Quick compile so first real run is fast."""
+    """Compile kernels once so the first real call is instant."""
     print("Compiling Triton kernels …")
 
-    N, r = 1000, 4
+    N, r = 1024, 4
     mu   = torch.randn(N, 3, device="cuda", dtype=torch.float32)
     W    = torch.randn(N, 3, r, device="cuda", dtype=torch.float16)
     b    = torch.randn(r,     device="cuda", dtype=torch.float16)
     vis  = torch.randint(0, 2, (N,), device="cuda", dtype=torch.bool)
 
-    _ = apply_deformation(mu, W, b)
-    _ = apply_deformation(mu, W, b, vis)
+    apply_deformation(mu, W, b)          # no mask
+    apply_deformation(mu, W, b, vis)     # with mask
 
     for H, Wimg in [(256, 256), (512, 512), (1080, 1920)]:
         mu_z  = torch.randn(N, device="cuda")
         idbuf = torch.randint(-1, N, (H, Wimg), device="cuda", dtype=torch.int32)
         depth = torch.randn(H, Wimg, device="cuda")
         conf  = torch.ones_like(depth)
-        _ = compute_depth_loss(mu_z, idbuf, depth, conf)
+        compute_depth_loss(mu_z, idbuf, depth, conf)
 
     print("Kernel compilation complete.")
