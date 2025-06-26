@@ -15,9 +15,9 @@ def deform_update_kernel(
     block_start = pid * BLOCK_SIZE
 
     # time-coefficients live in registers
-    b = tl.load(b_ptr + tl.arange(0, r)).to(tl.float32)
+    b = tl.load(b_ptr + tl.arange(0, r)).to(tl.float32)   # r is 4/8 → power-of-2
 
-    for off in tl.static_range(BLOCK_SIZE):            # compile-time unrolled
+    for off in tl.static_range(BLOCK_SIZE):               # compile-time unrolled
         idx           = block_start + off
         lane_is_valid = idx < N
 
@@ -28,14 +28,15 @@ def deform_update_kernel(
 
             base_mu = idx * 3
 
-            # load μ = [x,y,z]
+            # load μ = [x,y,z]  (scalar loads to avoid non-power-of-2 arange)
             mu_x = tl.load(mu_ptr + base_mu + 0).to(tl.float32)
             mu_y = tl.load(mu_ptr + base_mu + 1).to(tl.float32)
             mu_z = tl.load(mu_ptr + base_mu + 2).to(tl.float32)
 
-            d0 = tl.float32(0.0)  # delta_x
-            d1 = tl.float32(0.0)  # delta_y
-            d2 = tl.float32(0.0)  # delta_z
+            # delta accumulators
+            d0 = tl.full((), 0.0, tl.float32)
+            d1 = tl.full((), 0.0, tl.float32)
+            d2 = tl.full((), 0.0, tl.float32)
 
             if visible:
                 W_base = W_ptr + idx * 3 * r
@@ -48,13 +49,14 @@ def deform_update_kernel(
                     d1 += w1 * b[j]
                     d2 += w2 * b[j]
 
+            # store μ + Δ
             tl.store(mu_out_ptr + base_mu + 0, mu_x + d0)
             tl.store(mu_out_ptr + base_mu + 1, mu_y + d1)
             tl.store(mu_out_ptr + base_mu + 2, mu_z + d2)
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Depth residual kernel (unchanged except for no tl.arange)
+# Depth residual kernel  (unchanged except no non-power-of-2 arange)
 # ──────────────────────────────────────────────────────────────────────────
 @triton.autotune(
     configs=[
@@ -73,7 +75,7 @@ def depth_residual_kernel(
     pid         = tl.program_id(axis=0)
     block_start = pid * BLOCK_SIZE
 
-    t_loss  = tl.float32(0.0)
+    t_loss  = tl.full((), 0.0, tl.float32)
     t_valid = 0
 
     for i in tl.static_range(BLOCK_SIZE):
@@ -120,7 +122,7 @@ class DeformUpdateFunction(Function):
 
         out = torch.empty_like(mu)
         use_mask = vis is not None
-        vis_ptr  = vis if use_mask else mu  # dummy ptr, never deref if !use_mask
+        vis_ptr  = vis if use_mask else mu  # dummy pointer, never deref if !use_mask
 
         deform_update_kernel[grid](
             mu, W, b, out, vis_ptr,
@@ -162,8 +164,8 @@ class DepthResidualFunction(Function):
             HUBER_DELTA=huber_delta, BLOCK_SIZE=BLOCK,
         )
 
-        tot_loss   = loss_acc.sum()
-        tot_pix    = valid_cnt.sum().float()
+        tot_loss = loss_acc.sum()
+        tot_pix  = valid_cnt.sum().float()
         if tot_pix > 0:
             loss = tot_loss / tot_pix
             grad = grad_mu_z / tot_pix
@@ -198,12 +200,12 @@ def compile_kernels():
     print("Compiling Triton kernels …")
     N, r = 1024, 4
     mu   = torch.randn(N, 3, device='cuda', dtype=torch.float32)
-    W    = torch.randn(N, 3, r, device='cuda', dtype=torch.float16)
-    b    = torch.randn(r,     device='cuda', dtype=torch.float16)
-    vis  = torch.randint(0, 2, (N,), device='cuda', dtype=torch.bool)
+    Wmat = torch.randn(N, 3, r, device='cuda', dtype=torch.float16)
+    bvec = torch.randn(r,     device='cuda', dtype=torch.float16)
+    mask = torch.randint(0, 2, (N,), device='cuda', dtype=torch.bool)
 
-    apply_deformation(mu, W, b)
-    apply_deformation(mu, W, b, vis)
+    apply_deformation(mu, Wmat, bvec)
+    apply_deformation(mu, Wmat, bvec, mask)
 
     for H, Wimg in [(256, 256), (512, 512), (1080, 1920)]:
         mu_z  = torch.randn(N, device='cuda')
