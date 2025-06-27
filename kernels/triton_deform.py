@@ -19,13 +19,16 @@ def deform_update_kernel(
 ):
     """
     Optimized fused matrix-vector: μ_out = μ + W @ b(t)
-    Uses only masking and tl.where for all conditionals.
+    Uses explicit indexing to avoid power-of-2 requirements.
     """
     pid = tl.program_id(axis=0)
     
-    # Load time coefficients (all threads load the same data)
-    b_offsets = tl.arange(0, r)
-    b = tl.load(b_ptr + b_offsets, mask=b_offsets < r, other=0.0).to(tl.float32)
+    # Load time coefficients using power-of-2 arange
+    # Support up to rank 8 (next power of 2 after common rank 4)
+    MAX_RANK = 8
+    b_offsets = tl.arange(0, MAX_RANK)
+    b_mask = b_offsets < r
+    b = tl.load(b_ptr + b_offsets, mask=b_mask, other=0.0).to(tl.float32)
     
     # Process each splat in the block using static range
     for block_offset in tl.static_range(BLOCK_SIZE):
@@ -34,9 +37,10 @@ def deform_update_kernel(
         # Create mask for valid splat
         valid_splat = splat_idx < N
         
-        # Load original centroid
-        mu_offsets = tl.arange(0, 3)
-        mu = tl.load(mu_ptr + splat_idx * 3 + mu_offsets, mask=valid_splat, other=0.0)
+        # Load original centroid (explicit indexing for 3D)
+        mu_x = tl.load(mu_ptr + splat_idx * 3 + 0, mask=valid_splat, other=0.0)
+        mu_y = tl.load(mu_ptr + splat_idx * 3 + 1, mask=valid_splat, other=0.0)
+        mu_z = tl.load(mu_ptr + splat_idx * 3 + 2, mask=valid_splat, other=0.0)
         
         # Determine if we should apply deformation
         should_deform = valid_splat
@@ -44,23 +48,90 @@ def deform_update_kernel(
             visibility = tl.load(visibility_mask_ptr + splat_idx, mask=valid_splat, other=False)
             should_deform = should_deform & visibility
         
-        # Compute deformation delta
-        delta = tl.zeros([3], dtype=tl.float32)
+        # Compute deformation delta using explicit loop unrolling
+        delta_x = tl.float32(0.0)
+        delta_y = tl.float32(0.0)
+        delta_z = tl.float32(0.0)
         
         # Only compute deformation for valid, visible splats
         W_base = W_ptr + splat_idx * 3 * r
-        for j in tl.static_range(r):
-            W_col_offsets = tl.arange(0, 3) * r + j
-            W_col = tl.load(W_base + W_col_offsets, mask=valid_splat, other=0.0).to(tl.float32)
-            delta += W_col * b[j]
+        
+        # Unroll the matrix-vector multiplication for common ranks
+        if r >= 1:
+            W_x0 = tl.load(W_base + 0 * r + 0, mask=valid_splat, other=0.0).to(tl.float32)
+            W_y0 = tl.load(W_base + 1 * r + 0, mask=valid_splat, other=0.0).to(tl.float32)
+            W_z0 = tl.load(W_base + 2 * r + 0, mask=valid_splat, other=0.0).to(tl.float32)
+            delta_x += W_x0 * b[0]
+            delta_y += W_y0 * b[0]
+            delta_z += W_z0 * b[0]
+        
+        if r >= 2:
+            W_x1 = tl.load(W_base + 0 * r + 1, mask=valid_splat, other=0.0).to(tl.float32)
+            W_y1 = tl.load(W_base + 1 * r + 1, mask=valid_splat, other=0.0).to(tl.float32)
+            W_z1 = tl.load(W_base + 2 * r + 1, mask=valid_splat, other=0.0).to(tl.float32)
+            delta_x += W_x1 * b[1]
+            delta_y += W_y1 * b[1]
+            delta_z += W_z1 * b[1]
+        
+        if r >= 3:
+            W_x2 = tl.load(W_base + 0 * r + 2, mask=valid_splat, other=0.0).to(tl.float32)
+            W_y2 = tl.load(W_base + 1 * r + 2, mask=valid_splat, other=0.0).to(tl.float32)
+            W_z2 = tl.load(W_base + 2 * r + 2, mask=valid_splat, other=0.0).to(tl.float32)
+            delta_x += W_x2 * b[2]
+            delta_y += W_y2 * b[2]
+            delta_z += W_z2 * b[2]
+        
+        if r >= 4:
+            W_x3 = tl.load(W_base + 0 * r + 3, mask=valid_splat, other=0.0).to(tl.float32)
+            W_y3 = tl.load(W_base + 1 * r + 3, mask=valid_splat, other=0.0).to(tl.float32)
+            W_z3 = tl.load(W_base + 2 * r + 3, mask=valid_splat, other=0.0).to(tl.float32)
+            delta_x += W_x3 * b[3]
+            delta_y += W_y3 * b[3]
+            delta_z += W_z3 * b[3]
+        
+        if r >= 5:
+            W_x4 = tl.load(W_base + 0 * r + 4, mask=valid_splat, other=0.0).to(tl.float32)
+            W_y4 = tl.load(W_base + 1 * r + 4, mask=valid_splat, other=0.0).to(tl.float32)
+            W_z4 = tl.load(W_base + 2 * r + 4, mask=valid_splat, other=0.0).to(tl.float32)
+            delta_x += W_x4 * b[4]
+            delta_y += W_y4 * b[4]
+            delta_z += W_z4 * b[4]
+        
+        if r >= 6:
+            W_x5 = tl.load(W_base + 0 * r + 5, mask=valid_splat, other=0.0).to(tl.float32)
+            W_y5 = tl.load(W_base + 1 * r + 5, mask=valid_splat, other=0.0).to(tl.float32)
+            W_z5 = tl.load(W_base + 2 * r + 5, mask=valid_splat, other=0.0).to(tl.float32)
+            delta_x += W_x5 * b[5]
+            delta_y += W_y5 * b[5]
+            delta_z += W_z5 * b[5]
+        
+        if r >= 7:
+            W_x6 = tl.load(W_base + 0 * r + 6, mask=valid_splat, other=0.0).to(tl.float32)
+            W_y6 = tl.load(W_base + 1 * r + 6, mask=valid_splat, other=0.0).to(tl.float32)
+            W_z6 = tl.load(W_base + 2 * r + 6, mask=valid_splat, other=0.0).to(tl.float32)
+            delta_x += W_x6 * b[6]
+            delta_y += W_y6 * b[6]
+            delta_z += W_z6 * b[6]
+        
+        if r >= 8:
+            W_x7 = tl.load(W_base + 0 * r + 7, mask=valid_splat, other=0.0).to(tl.float32)
+            W_y7 = tl.load(W_base + 1 * r + 7, mask=valid_splat, other=0.0).to(tl.float32)
+            W_z7 = tl.load(W_base + 2 * r + 7, mask=valid_splat, other=0.0).to(tl.float32)
+            delta_x += W_x7 * b[7]
+            delta_y += W_y7 * b[7]
+            delta_z += W_z7 * b[7]
         
         # Apply deformation conditionally
-        # Use scalar multiplication for conditional application
         deform_factor = tl.where(should_deform, 1.0, 0.0)
-        result = mu + delta * deform_factor
+        
+        result_x = mu_x + delta_x * deform_factor
+        result_y = mu_y + delta_y * deform_factor
+        result_z = mu_z + delta_z * deform_factor
         
         # Store result (only for valid splats)
-        tl.store(mu_out_ptr + splat_idx * 3 + mu_offsets, result, mask=valid_splat)
+        tl.store(mu_out_ptr + splat_idx * 3 + 0, result_x, mask=valid_splat)
+        tl.store(mu_out_ptr + splat_idx * 3 + 1, result_y, mask=valid_splat)
+        tl.store(mu_out_ptr + splat_idx * 3 + 2, result_z, mask=valid_splat)
 
 
 @triton.autotune(
@@ -87,7 +158,7 @@ def depth_residual_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Optimized depth residual computation using only masking.
+    Optimized depth residual computation using explicit indexing.
     """
     pid = tl.program_id(axis=0)
     
@@ -289,6 +360,9 @@ def apply_deformation(mu, W, b, visibility_mask=None):
     Returns:
         mu_deformed: [N, 3] deformed centroids
     """
+    # Validate inputs
+    validate_tensors(mu, W, b, visibility_mask)
+    
     return DeformUpdateFunction.apply(mu, W, b, visibility_mask)
 
 
@@ -306,6 +380,9 @@ def compute_depth_loss(mu_z, id_buffer, depth, confidence, huber_delta=0.01):
     Returns:
         loss: scalar depth loss
     """
+    # Validate inputs
+    validate_depth_tensors(mu_z, id_buffer, depth, confidence)
+    
     return DepthResidualFunction.apply(mu_z, id_buffer, depth, confidence, huber_delta)
 
 
@@ -313,21 +390,24 @@ def compile_kernels():
     """Compile Triton kernels for faster startup."""
     print("Compiling optimized Triton deformation kernels...")
     
-    # Dummy inputs for compilation
-    N, r = 1000, 4
-    H, W = 256, 256
+    # Test with different common ranks (up to 8 supported)
+    test_ranks = [4, 8]  # Common ranks that are power-of-2 friendly
+    N = 1000
     
-    mu = torch.randn(N, 3, device='cuda', dtype=torch.float32)
-    W = torch.randn(N, 3, r, device='cuda', dtype=torch.float16)
-    b = torch.randn(r, device='cuda', dtype=torch.float16)
-    visibility_mask = torch.randint(0, 2, (N,), device='cuda', dtype=torch.bool)
-    
-    # Compile deformation kernel with and without visibility mask
-    _ = apply_deformation(mu, W, b)
-    _ = apply_deformation(mu, W, b, visibility_mask)
+    for r in test_ranks:
+        print(f"  Compiling for rank {r}...")
+        mu = torch.randn(N, 3, device='cuda', dtype=torch.float32)
+        W = torch.randn(N, 3, r, device='cuda', dtype=torch.float16)
+        b = torch.randn(r, device='cuda', dtype=torch.float16)
+        visibility_mask = torch.randint(0, 2, (N,), device='cuda', dtype=torch.bool)
+        
+        # Compile deformation kernel with and without visibility mask
+        _ = apply_deformation(mu, W, b)
+        _ = apply_deformation(mu, W, b, visibility_mask)
     
     # Compile depth kernel with different sizes for autotuning
-    for h, w in [(256, 256), (512, 512), (1080, 1920)]:
+    print("  Compiling depth kernels...")
+    for h, w in [(256, 256), (512, 512)]:
         mu_z = torch.randn(N, device='cuda', dtype=torch.float32)
         id_buffer = torch.randint(-1, N, (h, w), device='cuda', dtype=torch.int32)
         depth = torch.randn(h, w, device='cuda', dtype=torch.float32)
@@ -336,7 +416,7 @@ def compile_kernels():
         try:
             _ = compute_depth_loss(mu_z, id_buffer, depth, confidence)
         except Exception as e:
-            print(f"Compilation warning for {h}x{w}: {e}")
+            print(f"    Compilation warning for {h}x{w}: {e}")
     
     print("Kernel compilation complete.")
 
@@ -350,6 +430,9 @@ def validate_tensors(mu, W, b, visibility_mask=None):
     
     N = mu.shape[0]
     r = b.shape[0]
+    
+    # Check rank limitations (kernel supports up to rank 8)
+    assert 1 <= r <= 8, f"Rank must be between 1 and 8, got {r}"
     
     assert W.shape == (N, 3, r), f"W must be [N, 3, r], got {W.shape}"
     assert W.dtype == torch.float16, f"W must be float16, got {W.dtype}"
@@ -465,7 +548,7 @@ if __name__ == "__main__":
         # Test compilation
         compile_kernels()
         
-        # Basic functionality test
+        # Basic functionality test with rank 4
         N, r = 1000, 4
         mu = torch.randn(N, 3, device='cuda', dtype=torch.float32)
         W = torch.randn(N, 3, r, device='cuda', dtype=torch.float16)
@@ -473,6 +556,19 @@ if __name__ == "__main__":
         
         result = apply_deformation(mu, W, b)
         print(f"✓ Deformation test passed: {result.shape}")
+        
+        # Test with visibility mask
+        visibility_mask = torch.randint(0, 2, (N,), device='cuda', dtype=torch.bool)
+        result_masked = apply_deformation(mu, W, b, visibility_mask)
+        print(f"✓ Deformation with visibility test passed: {result_masked.shape}")
+        
+        # Test different ranks
+        for test_r in [2, 4, 6, 8]:
+            print(f"Testing rank {test_r}...")
+            W_test = torch.randn(N, 3, test_r, device='cuda', dtype=torch.float16)
+            b_test = torch.randn(test_r, device='cuda', dtype=torch.float16)
+            result_test = apply_deformation(mu, W_test, b_test)
+            print(f"  ✓ Rank {test_r} passed: {result_test.shape}")
         
         # Test depth loss
         H, W = 256, 256
@@ -483,6 +579,21 @@ if __name__ == "__main__":
         
         loss = compute_depth_loss(mu_z, id_buffer, depth, confidence)
         print(f"✓ Depth loss test passed: {loss.item():.6f}")
+        
+        # Test gradients
+        print("Testing gradients...")
+        mu.requires_grad_(True)
+        W.requires_grad_(True)
+        b.requires_grad_(True)
+        
+        result = apply_deformation(mu, W, b)
+        loss_grad = result.sum()
+        loss_grad.backward()
+        
+        assert mu.grad is not None, "mu gradient not computed"
+        assert W.grad is not None, "W gradient not computed"
+        assert b.grad is not None, "b gradient not computed"
+        print("✓ Gradient computation passed")
         
         # Run benchmarks
         print("\nRunning performance benchmarks...")
