@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from torch.autograd import Function
 
+
 @triton.jit
 def deform_update_kernel(
     mu_ptr,          # [N, 3] float32
@@ -18,58 +19,48 @@ def deform_update_kernel(
 ):
     """
     Optimized fused matrix-vector: μ_out = μ + W @ b(t)
-    Uses block-based processing with shared memory for b coefficients.
+    Uses only masking and tl.where for all conditionals.
     """
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
     
-    # Load time coefficients into shared memory once per block
-    if tl.program_id(axis=0) == 0 and tl.program_id(axis=1) == 0:
-        # First thread loads b coefficients
-        b_range = tl.arange(0, r)
-        b_shared = tl.load(b_ptr + b_range, mask=b_range < r)
-    else:
-        b_shared = tl.zeros([r], dtype=tl.float16)
+    # Load time coefficients (all threads load the same data)
+    b_offsets = tl.arange(0, r)
+    b = tl.load(b_ptr + b_offsets, mask=b_offsets < r, other=0.0).to(tl.float32)
     
-    # Broadcast b to all threads in block (using register spilling)
-    b = tl.load(b_ptr + tl.arange(0, r)).to(tl.float32)
-    
-    # Process multiple splats per block
-    for block_offset in range(BLOCK_SIZE):
-        splat_idx = block_start + block_offset
-        if splat_idx >= N:
-            break
+    # Process each splat in the block using static range
+    for block_offset in tl.static_range(BLOCK_SIZE):
+        splat_idx = pid * BLOCK_SIZE + block_offset
         
-        # Check visibility if mask provided
-        if visibility_mask_ptr is not None:
-            is_visible = tl.load(visibility_mask_ptr + splat_idx)
-            if not is_visible:
-                # Copy original position unchanged
-                mu_x = tl.load(mu_ptr + splat_idx * 3 + 0)
-                mu_y = tl.load(mu_ptr + splat_idx * 3 + 1)
-                mu_z = tl.load(mu_ptr + splat_idx * 3 + 2)
-                tl.store(mu_out_ptr + splat_idx * 3 + 0, mu_x)
-                tl.store(mu_out_ptr + splat_idx * 3 + 1, mu_y)
-                tl.store(mu_out_ptr + splat_idx * 3 + 2, mu_z)
-                continue
+        # Create mask for valid splat
+        valid_splat = splat_idx < N
         
-        # Load original centroid using vectorized access
+        # Load original centroid
         mu_offsets = tl.arange(0, 3)
-        mu = tl.load(mu_ptr + splat_idx * 3 + mu_offsets)  # [3]
+        mu = tl.load(mu_ptr + splat_idx * 3 + mu_offsets, mask=valid_splat, other=0.0)
         
-        # Load W matrix for this splat [3, r] - keep as fp16, convert during compute
-        W_base = W_ptr + splat_idx * 3 * r
+        # Determine if we should apply deformation
+        should_deform = valid_splat
+        if visibility_mask_ptr is not None:
+            visibility = tl.load(visibility_mask_ptr + splat_idx, mask=valid_splat, other=False)
+            should_deform = should_deform & visibility
+        
+        # Compute deformation delta
         delta = tl.zeros([3], dtype=tl.float32)
         
-        # Compute W @ b efficiently
+        # Only compute deformation for valid, visible splats
+        W_base = W_ptr + splat_idx * 3 * r
         for j in tl.static_range(r):
             W_col_offsets = tl.arange(0, 3) * r + j
-            W_col = tl.load(W_base + W_col_offsets).to(tl.float32)  # [3]
+            W_col = tl.load(W_base + W_col_offsets, mask=valid_splat, other=0.0).to(tl.float32)
             delta += W_col * b[j]
         
-        # Store result μ + W @ b
-        result = mu + delta
-        tl.store(mu_out_ptr + splat_idx * 3 + mu_offsets, result)
+        # Apply deformation conditionally
+        # Use scalar multiplication for conditional application
+        deform_factor = tl.where(should_deform, 1.0, 0.0)
+        result = mu + delta * deform_factor
+        
+        # Store result (only for valid splats)
+        tl.store(mu_out_ptr + splat_idx * 3 + mu_offsets, result, mask=valid_splat)
 
 
 @triton.autotune(
@@ -96,72 +87,67 @@ def depth_residual_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """
-    Optimized depth residual computation with block-level reduction.
-    Uses proper atomic operations and handles scaling correctly.
+    Optimized depth residual computation using only masking.
     """
     pid = tl.program_id(axis=0)
-    block_start = pid * BLOCK_SIZE
     
-    # Per-thread accumulators
-    thread_loss = tl.float32(0.0)
-    thread_valid_count = 0
+    # Per-block accumulators
+    block_loss = tl.float32(0.0)
+    block_valid_count = 0
     
-    # Process pixels in this block
-    for i in range(BLOCK_SIZE):
-        pixel_idx = block_start + i
-        if pixel_idx >= H * W:
-            break
-            
-        # Load splat ID for this pixel
-        splat_id = tl.load(id_buffer_ptr + pixel_idx).to(tl.int32)
+    # Process each pixel in the block using static range
+    for i in tl.static_range(BLOCK_SIZE):
+        pixel_idx = pid * BLOCK_SIZE + i
         
-        # Skip background pixels
-        if splat_id < 0 or splat_id >= N:
-            continue
-            
-        # Load depth and confidence
-        gt_depth = tl.load(depth_ptr + pixel_idx)
-        confidence = tl.load(confidence_ptr + pixel_idx)
+        # Create masks for valid conditions
+        pixel_valid = pixel_idx < (H * W)
         
-        # Skip low confidence pixels
-        if confidence <= 0.0 or gt_depth <= 0.0:
-            continue
+        # Load data with masking
+        splat_id = tl.load(id_buffer_ptr + pixel_idx, mask=pixel_valid, other=-1).to(tl.int32)
+        gt_depth = tl.load(depth_ptr + pixel_idx, mask=pixel_valid, other=0.0)
+        confidence = tl.load(confidence_ptr + pixel_idx, mask=pixel_valid, other=0.0)
         
-        # Load predicted depth (z-coordinate of splat)
-        pred_depth = tl.load(mu_z_ptr + splat_id)
+        # Create validity conditions
+        splat_valid = (splat_id >= 0) & (splat_id < N)
+        depth_valid = (gt_depth > 0.0) & (confidence > 0.0)
+        all_valid = pixel_valid & splat_valid & depth_valid
         
-        # Compute residual
+        # Load predicted depth
+        pred_depth = tl.load(mu_z_ptr + splat_id, mask=all_valid, other=0.0)
+        
+        # Compute residual and loss (only when valid)
         residual = pred_depth - gt_depth
         abs_residual = tl.abs(residual)
         
-        # Smooth L1 (Huber) loss with consistent confidence weighting
-        if abs_residual <= HUBER_DELTA:
-            # Quadratic region: 0.5 * residual^2 / delta
-            loss_value = 0.5 * residual * residual / HUBER_DELTA
-            grad_value = residual / HUBER_DELTA
-        else:
-            # Linear region: |residual| - 0.5 * delta
-            loss_value = abs_residual - 0.5 * HUBER_DELTA
-            grad_value = tl.where(residual > 0, 1.0, -1.0)
+        # Smooth L1 (Huber) loss
+        loss_value = tl.where(
+            abs_residual <= HUBER_DELTA,
+            0.5 * residual * residual / HUBER_DELTA,  # Quadratic region
+            abs_residual - 0.5 * HUBER_DELTA         # Linear region
+        )
         
-        # Apply confidence weighting to both loss and gradient
-        weighted_loss = confidence * loss_value
-        weighted_grad = confidence * grad_value
+        grad_value = tl.where(
+            abs_residual <= HUBER_DELTA,
+            residual / HUBER_DELTA,                   # Quadratic gradient
+            tl.where(residual > 0, 1.0, -1.0)        # Linear gradient
+        )
         
-        # Accumulate in thread-local variables
-        thread_loss += weighted_loss
-        thread_valid_count += 1
+        # Apply confidence weighting and validity mask
+        weighted_loss = tl.where(all_valid, confidence * loss_value, 0.0)
+        weighted_grad = tl.where(all_valid, confidence * grad_value, 0.0)
+        valid_count = tl.where(all_valid, 1, 0)
         
-        # Atomic gradient accumulation (this is fine, gradients are additive)
-        tl.atomic_add(grad_mu_z_ptr + splat_id, weighted_grad)
+        # Accumulate in block-local variables
+        block_loss += weighted_loss
+        block_valid_count += valid_count
+        
+        # Atomic gradient accumulation
+        # Always do the atomic add, but weighted_grad will be 0 for invalid pixels
+        tl.atomic_add(grad_mu_z_ptr + tl.where(all_valid, splat_id, 0), weighted_grad)
     
-    # Block-level reduction using shared memory
-    # Note: Triton doesn't have explicit shared memory, so we'll use atomic operations
-    # but only one atomic per block instead of per thread
-    
-    # Each block writes its totals to separate locations
-    tl.store(loss_accumulator_ptr + pid, thread_loss)
-    tl.store(valid_pixel_count_ptr + pid, thread_valid_count)
+    # Store block-level results  
+    tl.store(loss_accumulator_ptr + pid, block_loss)
+    tl.store(valid_pixel_count_ptr + pid, tl.int32(block_valid_count))
 
 
 class DeformUpdateFunction(Function):
@@ -353,3 +339,160 @@ def compile_kernels():
             print(f"Compilation warning for {h}x{w}: {e}")
     
     print("Kernel compilation complete.")
+
+
+# Helper functions for debugging and validation
+def validate_tensors(mu, W, b, visibility_mask=None):
+    """Validate tensor shapes and dtypes for deformation kernels."""
+    assert mu.dim() == 2 and mu.shape[1] == 3, f"mu must be [N, 3], got {mu.shape}"
+    assert mu.dtype == torch.float32, f"mu must be float32, got {mu.dtype}"
+    assert mu.device.type == 'cuda', f"mu must be on CUDA, got {mu.device}"
+    
+    N = mu.shape[0]
+    r = b.shape[0]
+    
+    assert W.shape == (N, 3, r), f"W must be [N, 3, r], got {W.shape}"
+    assert W.dtype == torch.float16, f"W must be float16, got {W.dtype}"
+    assert W.device.type == 'cuda', f"W must be on CUDA, got {W.device}"
+    
+    assert b.dim() == 1, f"b must be 1D, got {b.dim()}D"
+    assert b.dtype == torch.float16, f"b must be float16, got {b.dtype}"
+    assert b.device.type == 'cuda', f"b must be on CUDA, got {b.device}"
+    
+    if visibility_mask is not None:
+        assert visibility_mask.shape == (N,), f"visibility_mask must be [N], got {visibility_mask.shape}"
+        assert visibility_mask.dtype == torch.bool, f"visibility_mask must be bool, got {visibility_mask.dtype}"
+        assert visibility_mask.device.type == 'cuda', f"visibility_mask must be on CUDA, got {visibility_mask.device}"
+
+
+def validate_depth_tensors(mu_z, id_buffer, depth, confidence):
+    """Validate tensor shapes and dtypes for depth loss kernels."""
+    N = mu_z.shape[0]
+    H, W = depth.shape
+    
+    assert mu_z.dim() == 1, f"mu_z must be 1D, got {mu_z.dim()}D"
+    assert mu_z.dtype == torch.float32, f"mu_z must be float32, got {mu_z.dtype}"
+    assert mu_z.device.type == 'cuda', f"mu_z must be on CUDA, got {mu_z.device}"
+    
+    assert id_buffer.shape == (H, W), f"id_buffer must be [H, W], got {id_buffer.shape}"
+    assert id_buffer.dtype == torch.int32, f"id_buffer must be int32, got {id_buffer.dtype}"
+    assert id_buffer.device.type == 'cuda', f"id_buffer must be on CUDA, got {id_buffer.device}"
+    
+    assert depth.shape == (H, W), f"depth must be [H, W], got {depth.shape}"
+    assert depth.dtype == torch.float32, f"depth must be float32, got {depth.dtype}"
+    assert depth.device.type == 'cuda', f"depth must be on CUDA, got {depth.device}"
+    
+    assert confidence.shape == (H, W), f"confidence must be [H, W], got {confidence.shape}"
+    assert confidence.dtype == torch.float32, f"confidence must be float32, got {confidence.dtype}"
+    assert confidence.device.type == 'cuda', f"confidence must be on CUDA, got {confidence.device}"
+
+
+# Performance benchmarking utilities
+def benchmark_deformation_kernel(N=10000, r=4, num_runs=100, warmup=10):
+    """Benchmark the deformation kernel performance."""
+    mu = torch.randn(N, 3, device='cuda', dtype=torch.float32)
+    W = torch.randn(N, 3, r, device='cuda', dtype=torch.float16)
+    b = torch.randn(r, device='cuda', dtype=torch.float16)
+    
+    # Warmup
+    for _ in range(warmup):
+        _ = apply_deformation(mu, W, b)
+    
+    torch.cuda.synchronize()
+    
+    # Benchmark
+    import time
+    start_time = time.time()
+    
+    for _ in range(num_runs):
+        result = apply_deformation(mu, W, b)
+    
+    torch.cuda.synchronize()
+    end_time = time.time()
+    
+    avg_time_ms = (end_time - start_time) / num_runs * 1000
+    
+    print(f"Deformation kernel benchmark:")
+    print(f"  N={N}, r={r}")
+    print(f"  Average time: {avg_time_ms:.3f} ms")
+    print(f"  Throughput: {N / avg_time_ms * 1000:.0f} splats/sec")
+    
+    return avg_time_ms
+
+
+def benchmark_depth_kernel(N=10000, H=512, W=512, num_runs=100, warmup=10):
+    """Benchmark the depth loss kernel performance."""
+    mu_z = torch.randn(N, device='cuda', dtype=torch.float32) + 5.0
+    id_buffer = torch.randint(-1, N, (H, W), device='cuda', dtype=torch.int32)
+    depth = torch.randn(H, W, device='cuda', dtype=torch.float32).abs() + 1.0
+    confidence = torch.ones(H, W, device='cuda', dtype=torch.float32) * 0.8
+    
+    # Warmup
+    for _ in range(warmup):
+        _ = compute_depth_loss(mu_z, id_buffer, depth, confidence)
+    
+    torch.cuda.synchronize()
+    
+    # Benchmark
+    import time
+    start_time = time.time()
+    
+    for _ in range(num_runs):
+        loss = compute_depth_loss(mu_z, id_buffer, depth, confidence)
+    
+    torch.cuda.synchronize()
+    end_time = time.time()
+    
+    avg_time_ms = (end_time - start_time) / num_runs * 1000
+    
+    print(f"Depth loss kernel benchmark:")
+    print(f"  Resolution: {H}x{W}, N={N}")
+    print(f"  Average time: {avg_time_ms:.3f} ms")
+    print(f"  Throughput: {H * W / avg_time_ms * 1000:.0f} pixels/sec")
+    
+    return avg_time_ms
+
+
+if __name__ == "__main__":
+    """Test script when run directly."""
+    print("Testing Triton deformation kernels...")
+    
+    if not torch.cuda.is_available():
+        print("CUDA not available!")
+        exit(1)
+    
+    try:
+        # Test compilation
+        compile_kernels()
+        
+        # Basic functionality test
+        N, r = 1000, 4
+        mu = torch.randn(N, 3, device='cuda', dtype=torch.float32)
+        W = torch.randn(N, 3, r, device='cuda', dtype=torch.float16)
+        b = torch.randn(r, device='cuda', dtype=torch.float16)
+        
+        result = apply_deformation(mu, W, b)
+        print(f"✓ Deformation test passed: {result.shape}")
+        
+        # Test depth loss
+        H, W = 256, 256
+        mu_z = torch.randn(N, device='cuda', dtype=torch.float32) + 5.0
+        id_buffer = torch.randint(-1, N, (H, W), device='cuda', dtype=torch.int32)
+        depth = torch.randn(H, W, device='cuda', dtype=torch.float32).abs() + 1.0
+        confidence = torch.ones(H, W, device='cuda', dtype=torch.float32) * 0.5
+        
+        loss = compute_depth_loss(mu_z, id_buffer, depth, confidence)
+        print(f"✓ Depth loss test passed: {loss.item():.6f}")
+        
+        # Run benchmarks
+        print("\nRunning performance benchmarks...")
+        benchmark_deformation_kernel()
+        benchmark_depth_kernel()
+        
+        print("\n🎉 All tests passed!")
+        
+    except Exception as e:
+        print(f"❌ Test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        exit(1)
