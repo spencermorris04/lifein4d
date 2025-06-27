@@ -19,16 +19,19 @@ def deform_update_kernel(
 ):
     """
     Optimized fused matrix-vector: μ_out = μ + W @ b(t)
-    Uses explicit indexing to avoid power-of-2 requirements.
+    Uses explicit indexing to completely avoid tl.arange().
     """
     pid = tl.program_id(axis=0)
     
-    # Load time coefficients using power-of-2 arange
-    # Support up to rank 8 (next power of 2 after common rank 4)
-    MAX_RANK = 8
-    b_offsets = tl.arange(0, MAX_RANK)
-    b_mask = b_offsets < r
-    b = tl.load(b_ptr + b_offsets, mask=b_mask, other=0.0).to(tl.float32)
+    # Load time coefficients using explicit indexing (avoid tl.arange)
+    b0 = tl.load(b_ptr + 0).to(tl.float32) if r >= 1 else 0.0
+    b1 = tl.load(b_ptr + 1).to(tl.float32) if r >= 2 else 0.0
+    b2 = tl.load(b_ptr + 2).to(tl.float32) if r >= 3 else 0.0
+    b3 = tl.load(b_ptr + 3).to(tl.float32) if r >= 4 else 0.0
+    b4 = tl.load(b_ptr + 4).to(tl.float32) if r >= 5 else 0.0
+    b5 = tl.load(b_ptr + 5).to(tl.float32) if r >= 6 else 0.0
+    b6 = tl.load(b_ptr + 6).to(tl.float32) if r >= 7 else 0.0
+    b7 = tl.load(b_ptr + 7).to(tl.float32) if r >= 8 else 0.0
     
     # Process each splat in the block using static range
     for block_offset in tl.static_range(BLOCK_SIZE):
@@ -48,78 +51,78 @@ def deform_update_kernel(
             visibility = tl.load(visibility_mask_ptr + splat_idx, mask=valid_splat, other=False)
             should_deform = should_deform & visibility
         
-        # Compute deformation delta using explicit loop unrolling
+        # Compute deformation delta using explicit unrolling
         delta_x = tl.float32(0.0)
         delta_y = tl.float32(0.0)
         delta_z = tl.float32(0.0)
         
-        # Only compute deformation for valid, visible splats
+        # Base address for W matrix
         W_base = W_ptr + splat_idx * 3 * r
         
-        # Unroll the matrix-vector multiplication for common ranks
+        # Unroll the matrix-vector multiplication explicitly
         if r >= 1:
             W_x0 = tl.load(W_base + 0 * r + 0, mask=valid_splat, other=0.0).to(tl.float32)
             W_y0 = tl.load(W_base + 1 * r + 0, mask=valid_splat, other=0.0).to(tl.float32)
             W_z0 = tl.load(W_base + 2 * r + 0, mask=valid_splat, other=0.0).to(tl.float32)
-            delta_x += W_x0 * b[0]
-            delta_y += W_y0 * b[0]
-            delta_z += W_z0 * b[0]
+            delta_x += W_x0 * b0
+            delta_y += W_y0 * b0
+            delta_z += W_z0 * b0
         
         if r >= 2:
             W_x1 = tl.load(W_base + 0 * r + 1, mask=valid_splat, other=0.0).to(tl.float32)
             W_y1 = tl.load(W_base + 1 * r + 1, mask=valid_splat, other=0.0).to(tl.float32)
             W_z1 = tl.load(W_base + 2 * r + 1, mask=valid_splat, other=0.0).to(tl.float32)
-            delta_x += W_x1 * b[1]
-            delta_y += W_y1 * b[1]
-            delta_z += W_z1 * b[1]
+            delta_x += W_x1 * b1
+            delta_y += W_y1 * b1
+            delta_z += W_z1 * b1
         
         if r >= 3:
             W_x2 = tl.load(W_base + 0 * r + 2, mask=valid_splat, other=0.0).to(tl.float32)
             W_y2 = tl.load(W_base + 1 * r + 2, mask=valid_splat, other=0.0).to(tl.float32)
             W_z2 = tl.load(W_base + 2 * r + 2, mask=valid_splat, other=0.0).to(tl.float32)
-            delta_x += W_x2 * b[2]
-            delta_y += W_y2 * b[2]
-            delta_z += W_z2 * b[2]
+            delta_x += W_x2 * b2
+            delta_y += W_y2 * b2
+            delta_z += W_z2 * b2
         
         if r >= 4:
             W_x3 = tl.load(W_base + 0 * r + 3, mask=valid_splat, other=0.0).to(tl.float32)
             W_y3 = tl.load(W_base + 1 * r + 3, mask=valid_splat, other=0.0).to(tl.float32)
             W_z3 = tl.load(W_base + 2 * r + 3, mask=valid_splat, other=0.0).to(tl.float32)
-            delta_x += W_x3 * b[3]
-            delta_y += W_y3 * b[3]
-            delta_z += W_z3 * b[3]
+            delta_x += W_x3 * b3
+            delta_y += W_y3 * b3
+            delta_z += W_z3 * b3
         
         if r >= 5:
             W_x4 = tl.load(W_base + 0 * r + 4, mask=valid_splat, other=0.0).to(tl.float32)
             W_y4 = tl.load(W_base + 1 * r + 4, mask=valid_splat, other=0.0).to(tl.float32)
             W_z4 = tl.load(W_base + 2 * r + 4, mask=valid_splat, other=0.0).to(tl.float32)
-            delta_x += W_x4 * b[4]
-            delta_y += W_y4 * b[4]
-            delta_z += W_z4 * b[4]
+            delta_x += W_x4 * b4
+            delta_y += W_y4 * b4
+            delta_z += W_z4 * b4
         
         if r >= 6:
             W_x5 = tl.load(W_base + 0 * r + 5, mask=valid_splat, other=0.0).to(tl.float32)
             W_y5 = tl.load(W_base + 1 * r + 5, mask=valid_splat, other=0.0).to(tl.float32)
             W_z5 = tl.load(W_base + 2 * r + 5, mask=valid_splat, other=0.0).to(tl.float32)
-            delta_x += W_x5 * b[5]
-            delta_y += W_y5 * b[5]
-            delta_z += W_z5 * b[5]
+            delta_x += W_x5 * b5
+            delta_y += W_y5 * b5
+            delta_z += W_z5 * b5
         
         if r >= 7:
             W_x6 = tl.load(W_base + 0 * r + 6, mask=valid_splat, other=0.0).to(tl.float32)
             W_y6 = tl.load(W_base + 1 * r + 6, mask=valid_splat, other=0.0).to(tl.float32)
             W_z6 = tl.load(W_base + 2 * r + 6, mask=valid_splat, other=0.0).to(tl.float32)
-            delta_x += W_x6 * b[6]
-            delta_y += W_y6 * b[6]
-            delta_z += W_z6 * b[6]
+            delta_x += W_x6 * b6
+            delta_y += W_y6 * b6
+            delta_z += W_z6 * b6
         
         if r >= 8:
             W_x7 = tl.load(W_base + 0 * r + 7, mask=valid_splat, other=0.0).to(tl.float32)
             W_y7 = tl.load(W_base + 1 * r + 7, mask=valid_splat, other=0.0).to(tl.float32)
             W_z7 = tl.load(W_base + 2 * r + 7, mask=valid_splat, other=0.0).to(tl.float32)
-            delta_x += W_x7 * b[7]
-            delta_y += W_y7 * b[7]
-            delta_z += W_z7 * b[7]
+            delta_x += W_x7 * b7
+            delta_y += W_y7 * b7
+            delta_z += W_z7 * b7
         
         # Apply deformation conditionally
         deform_factor = tl.where(should_deform, 1.0, 0.0)
